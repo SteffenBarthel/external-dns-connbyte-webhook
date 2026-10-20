@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -54,6 +55,15 @@ func envInt(key string, def int) int {
 	return def
 }
 
+func envDuration(key string, def time.Duration) time.Duration {
+	if v, ok := os.LookupEnv(key); ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
 func envBool(key string, def bool) bool {
 	if v, ok := os.LookupEnv(key); ok {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -76,7 +86,7 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&c.healthAddr, "health-address", env("HEALTH_LISTEN_ADDRESS", "0.0.0.0:8080"), "address of /healthz (env HEALTH_LISTEN_ADDRESS)")
 	fs.StringVar(&c.logLevel, "log-level", env("LOG_LEVEL", "info"), "debug, info, warn or error (env LOG_LEVEL)")
 	fs.StringVar(&c.logFormat, "log-format", env("LOG_FORMAT", "text"), "text or json (env LOG_FORMAT)")
-	fs.DurationVar(&c.requestTimeout, "request-timeout", 25*time.Second, "timeout for one external-dns request, keep it below the external-dns webhook timeouts")
+	fs.DurationVar(&c.requestTimeout, "request-timeout", envDuration("REQUEST_TIMEOUT", 14*time.Second), "timeout for one external-dns request (env REQUEST_TIMEOUT); keep it below --webhook-provider-read-timeout + --webhook-provider-write-timeout of external-dns (default 15s)")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return c, err
@@ -97,10 +107,41 @@ func parseConfig(args []string) (config, error) {
 	if c.token == "" {
 		return c, errors.New("CONNBYTE_API_TOKEN (or --connbyte-api-token-file) is required")
 	}
+	if err := checkAPIURL(c.apiURL); err != nil {
+		return c, err
+	}
+	if c.requestTimeout <= 0 {
+		return c, errors.New("--request-timeout must be greater than 0")
+	}
 	if c.defaultTTL < provider.MinTTL || c.defaultTTL > provider.MaxTTL {
 		return c, fmt.Errorf("--default-ttl must be between %d and %d", provider.MinTTL, provider.MaxTTL)
 	}
 	return c, nil
+}
+
+// checkAPIURL only allows https, so the token is never sent in clear text.
+// Plain http is accepted for localhost (tests and local mocks).
+func checkAPIURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("--connbyte-api-url %q is not a valid URL", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return fmt.Errorf("--connbyte-api-url must use https (http is only allowed for localhost)")
 }
 
 func newLogger(level, format string) *slog.Logger {
@@ -162,6 +203,9 @@ func main() {
 		}(s, ln)
 	}
 	log.Info("started", "version", version, "domainFilter", cfg.domainFilter, "dryRun", cfg.dryRun)
+	if strings.TrimSpace(strings.ReplaceAll(cfg.domainFilter, ",", "")) == "" {
+		log.Warn("no --domain-filter set: all zones of the ConnByte account can be changed")
+	}
 
 	select {
 	case <-ctx.Done():

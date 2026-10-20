@@ -47,6 +47,10 @@ spec:
         app: external-dns
     spec:
       serviceAccountName: external-dns
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: external-dns
           image: registry.k8s.io/external-dns/external-dns:v0.23.0
@@ -55,8 +59,16 @@ spec:
             - --source=service
             - --provider=webhook
             - --txt-owner-id=my-cluster
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
         - name: connbyte-webhook
-          image: ghcr.io/steffenbarthel/external-dns-connbyte-webhook:latest
+          image: ghcr.io/steffenbarthel/external-dns-connbyte-webhook:0.1.0
           args:
             - --domain-filter=example.com
           env:
@@ -66,16 +78,16 @@ spec:
                   name: connbyte-api-token
                   key: CONNBYTE_API_TOKEN
           ports:
-            - name: health
+            - name: http-webhook
               containerPort: 8080
           livenessProbe:
             httpGet:
               path: /healthz
-              port: health
+              port: http-webhook
           readinessProbe:
             httpGet:
               path: /healthz
-              port: health
+              port: http-webhook
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
