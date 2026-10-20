@@ -1,8 +1,8 @@
 package provider_test
 
 import (
+	"bytes"
 	"context"
-	"io"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -16,6 +16,12 @@ import (
 
 func setup(t *testing.T, cfg provider.Config) (*connbytetest.Server, *provider.Provider) {
 	t.Helper()
+	srv, p, _ := setupLog(t, cfg)
+	return srv, p
+}
+
+func setupLog(t *testing.T, cfg provider.Config) (*connbytetest.Server, *provider.Provider, *bytes.Buffer) {
+	t.Helper()
 	srv := connbytetest.New("secret")
 	t.Cleanup(srv.Close)
 	srv.AddZone("Z1", "example.com")
@@ -25,7 +31,8 @@ func setup(t *testing.T, cfg provider.Config) (*connbytetest.Server, *provider.P
 	if err != nil {
 		t.Fatal(err)
 	}
-	return srv, provider.New(c, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	logs := &bytes.Buffer{}
+	return srv, provider.New(c, cfg, slog.New(slog.NewTextHandler(logs, nil))), logs
 }
 
 func ep(name, typ string, ttl int64, targets ...string) *webhook.Endpoint {
@@ -180,7 +187,7 @@ func TestApplyTTLChange(t *testing.T) {
 }
 
 func TestDomainFilterProtectsOtherZones(t *testing.T) {
-	srv, p := setup(t, provider.Config{DomainFilter: []string{"example.com"}, ExcludeDomains: []string{"sub.example.com"}})
+	srv, p, logs := setupLog(t, provider.Config{DomainFilter: []string{"example.com"}, ExcludeDomains: []string{"sub.example.com"}})
 	srv.AddRecord("Z3", "www", "A", "198.51.100.1", 300, 0)
 	srv.AddRecord("Z2", "api", "A", "198.51.100.2", 300, 0)
 
@@ -191,8 +198,11 @@ func TestDomainFilterProtectsOtherZones(t *testing.T) {
 			ep("api.sub.example.com", "A", 300, "198.51.100.2"),
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "outside the domain filter") {
-		t.Fatalf("expected domain filter error, got %v", err)
+	if err != nil {
+		t.Fatalf("domain filter violations are permanent and must not be retried: %v", err)
+	}
+	if strings.Count(logs.String(), "outside the domain filter") != 3 {
+		t.Fatalf("expected 3 logged domain filter errors, got:\n%s", logs)
 	}
 	if n := srv.CountCalls("/ns/record/delete") + srv.CountCalls("/ns/record/create"); n != 0 {
 		t.Fatalf("%d write calls outside the domain filter", n)
@@ -254,15 +264,198 @@ func TestAdjustEndpoints(t *testing.T) {
 }
 
 func TestInvalidTargetsRejected(t *testing.T) {
-	srv, p := setup(t, provider.Config{})
+	srv, p, logs := setupLog(t, provider.Config{})
 	err := p.ApplyChanges(context.Background(), &webhook.Changes{Create: []*webhook.Endpoint{
 		ep("mx.example.com", "MX", 300, "mail.example.com"),
 		ep("txt.example.com", "TXT", 300, "a\nb"),
+		ep("bad name.example.com", "A", 300, "192.0.2.1"),
+		ep("crlf\r\n.example.com", "A", 300, "192.0.2.1"),
 	}})
-	if err == nil {
-		t.Fatal("expected error")
+	if err != nil {
+		t.Fatalf("invalid input is permanent and must not be retried: %v", err)
+	}
+	for _, want := range []string{"missing priority", "control characters", "spaces or control characters"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log misses %q:\n%s", want, logs)
+		}
 	}
 	if n := srv.CountCalls("/ns/record/create"); n != 0 {
 		t.Fatalf("invalid targets were sent: %d", n)
+	}
+}
+
+func TestUpdateWithInvalidNewTargetKeepsOld(t *testing.T) {
+	srv, p, logs := setupLog(t, provider.Config{})
+	old := srv.AddRecord("Z1", "", "MX", "old.example.com.", 300, 10)
+	err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		UpdateOld: []*webhook.Endpoint{ep("example.com", "MX", 300, "10 old.example.com")},
+		UpdateNew: []*webhook.Endpoint{ep("example.com", "MX", 300, "new.example.com")},
+	})
+	if err != nil {
+		t.Fatalf("invalid target is permanent: %v", err)
+	}
+	if !strings.Contains(logs.String(), "missing priority") {
+		t.Fatalf("invalid target not logged:\n%s", logs)
+	}
+	recs := srv.Records("Z1")
+	if len(recs) != 1 || recs[0].ID != old {
+		t.Fatalf("old MX must stay when the new target is invalid: %+v", recs)
+	}
+	if n := srv.CountCalls("/ns/record/delete") + srv.CountCalls("/ns/record/create"); n != 0 {
+		t.Fatalf("%d write calls for a skipped update", n)
+	}
+}
+
+func TestUpdateCreateFailureKeepsOld(t *testing.T) {
+	tests := []struct {
+		typ, content string
+		prio         int
+		oldT, newT   string
+	}{
+		{"A", "192.0.2.1", 0, "192.0.2.1", "192.0.2.2"},
+		{"TXT", "v=old", 0, "v=old", "v=new"},
+		{"MX", "a.example.net.", 10, "10 a.example.net", "20 b.example.net"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.typ, func(t *testing.T) {
+			srv, p := setup(t, provider.Config{})
+			old := srv.AddRecord("Z1", "www", tt.typ, tt.content, 300, tt.prio)
+			srv.FailPath, srv.FailStatus = "/ns/record/create", 500
+			err := p.ApplyChanges(context.Background(), &webhook.Changes{
+				UpdateOld: []*webhook.Endpoint{ep("www.example.com", tt.typ, 300, tt.oldT)},
+				UpdateNew: []*webhook.Endpoint{ep("www.example.com", tt.typ, 300, tt.newT)},
+			})
+			if err == nil || !strings.Contains(err.Error(), "create "+tt.typ) {
+				t.Fatalf("API 5xx must be returned for a retry, got %v", err)
+			}
+			if n := srv.CountCalls("/ns/record/delete"); n != 0 {
+				t.Fatalf("old record deleted although the create failed (%d deletes)", n)
+			}
+			if recs := srv.Records("Z1"); len(recs) != 1 || recs[0].ID != old {
+				t.Fatalf("old record must stay: %+v", recs)
+			}
+		})
+	}
+}
+
+func TestUpdateCreatesBeforeDeletes(t *testing.T) {
+	srv, p := setup(t, provider.Config{})
+	srv.AddRecord("Z1", "www", "A", "192.0.2.1", 300, 0)
+	err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		UpdateOld: []*webhook.Endpoint{ep("www.example.com", "A", 300, "192.0.2.1")},
+		UpdateNew: []*webhook.Endpoint{ep("www.example.com", "A", 300, "192.0.2.2")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, c := range srv.Calls() {
+		if c.Path != "/ns/record/list" && c.Path != "/ns/zone/list" {
+			paths = append(paths, c.Path)
+		}
+	}
+	if !reflect.DeepEqual(paths, []string{"/ns/record/create", "/ns/record/delete"}) {
+		t.Fatalf("want create before delete, got %v", paths)
+	}
+	if recs := srv.Records("Z1"); len(recs) != 1 || recs[0].Content != "192.0.2.2" {
+		t.Fatalf("unexpected records %+v", recs)
+	}
+}
+
+func TestCNAMEUpdateDeletesFirstAndRestoresOnFailure(t *testing.T) {
+	srv, p := setup(t, provider.Config{})
+	srv.AddRecord("Z1", "api", "CNAME", "old.example.net.", 300, 0)
+	srv.FailPath, srv.FailStatus, srv.FailTimes = "/ns/record/create", 500, 1
+	err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		UpdateOld: []*webhook.Endpoint{ep("api.example.com", "CNAME", 300, "old.example.net")},
+		UpdateNew: []*webhook.Endpoint{ep("api.example.com", "CNAME", 300, "new.example.net")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "create CNAME") {
+		t.Fatalf("API 5xx must be returned for a retry, got %v", err)
+	}
+	recs := srv.Records("Z1")
+	if len(recs) != 1 || recs[0].Type != "CNAME" || strings.TrimSuffix(recs[0].Content, ".") != "old.example.net" || recs[0].TTL != 300 {
+		t.Fatalf("old CNAME must be restored: %+v", recs)
+	}
+
+	// Next sync without failure: the CNAME is replaced.
+	err = p.ApplyChanges(context.Background(), &webhook.Changes{
+		UpdateOld: []*webhook.Endpoint{ep("api.example.com", "CNAME", 300, "old.example.net")},
+		UpdateNew: []*webhook.Endpoint{ep("api.example.com", "CNAME", 300, "new.example.net")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs = srv.Records("Z1")
+	if len(recs) != 1 || recs[0].Content != "new.example.net" {
+		t.Fatalf("CNAME not replaced: %+v", recs)
+	}
+}
+
+func TestPermanentAPIErrorIsLoggedNotReturned(t *testing.T) {
+	srv, p, logs := setupLog(t, provider.Config{})
+	srv.FailPath, srv.FailStatus = "/ns/record/create", 400
+	err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		Create: []*webhook.Endpoint{ep("a.example.com", "A", 300, "192.0.2.1")},
+	})
+	if err != nil {
+		t.Fatalf("API 4xx is permanent and must not be returned: %v", err)
+	}
+	if !strings.Contains(logs.String(), "not retried") || !strings.Contains(logs.String(), "level=ERROR") {
+		t.Fatalf("permanent error not logged as error:\n%s", logs)
+	}
+
+	srv.FailStatus = 429
+	if err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		Create: []*webhook.Endpoint{ep("a.example.com", "A", 300, "192.0.2.1")},
+	}); err == nil {
+		t.Fatal("API 429 is temporary and must be returned")
+	}
+}
+
+func TestDisabledRecordsAreIgnored(t *testing.T) {
+	srv, p := setup(t, provider.Config{})
+	off := srv.AddRecord("Z1", "www", "A", "192.0.2.1", 300, 0)
+	srv.Disable("Z1", off)
+
+	eps, err := p.Records(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 0 {
+		t.Fatalf("disabled records must not be reported: %+v", eps)
+	}
+	// A delete never touches the disabled record.
+	if err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		Delete: []*webhook.Endpoint{ep("www.example.com", "A", 300, "192.0.2.1")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A create adds an active record next to the disabled one.
+	if err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		Create: []*webhook.Endpoint{ep("www.example.com", "A", 300, "192.0.2.1")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recs := srv.Records("Z1")
+	if len(recs) != 2 || recs[0].ID != off || recs[0].Disabled != 1 || recs[1].Disabled != 0 {
+		t.Fatalf("disabled record must stay untouched and an active one be created: %+v", recs)
+	}
+}
+
+func TestTTLChangeRestoresOnFailure(t *testing.T) {
+	srv, p := setup(t, provider.Config{})
+	srv.AddRecord("Z1", "www", "A", "192.0.2.1", 300, 0)
+	srv.FailPath, srv.FailStatus, srv.FailTimes = "/ns/record/create", 503, 1
+	err := p.ApplyChanges(context.Background(), &webhook.Changes{
+		UpdateOld: []*webhook.Endpoint{ep("www.example.com", "A", 300, "192.0.2.1")},
+		UpdateNew: []*webhook.Endpoint{ep("www.example.com", "A", 900, "192.0.2.1")},
+	})
+	if err == nil {
+		t.Fatal("API 5xx must be returned for a retry")
+	}
+	recs := srv.Records("Z1")
+	if len(recs) != 1 || recs[0].Content != "192.0.2.1" || recs[0].TTL != 300 {
+		t.Fatalf("old record must be restored: %+v", recs)
 	}
 }

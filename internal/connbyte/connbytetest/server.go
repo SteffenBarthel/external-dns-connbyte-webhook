@@ -38,9 +38,12 @@ type Server struct {
 	records map[string][]Record
 	nextID  int64
 	calls   []Call
-	// FailPath makes every request to this path fail with FailStatus.
+	// FailPath makes requests to this path fail with FailStatus.
 	FailPath   string
 	FailStatus int
+	// FailTimes limits how many requests fail; 0 means all of them.
+	FailTimes int
+	failed    int
 }
 
 // New starts a mock server that accepts the given bearer token.
@@ -75,6 +78,17 @@ func (s *Server) add(zoneID, name, typ, content string, ttl, priority int) int64
 	s.nextID++
 	s.records[zoneID] = append(s.records[zoneID], Record{ID: s.nextID, Name: fqdn, Type: typ, Content: content, TTL: ttl, Priority: priority})
 	return s.nextID
+}
+
+// Disable marks a record as disabled.
+func (s *Server) Disable(zoneID string, id int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.records[zoneID] {
+		if s.records[zoneID][i].ID == id {
+			s.records[zoneID][i].Disabled = 1
+		}
+	}
 }
 
 // Records returns a sorted copy of the records of a zone.
@@ -156,7 +170,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		reply(w, 404, path, nil, nil)
 		return
 	}
-	if s.FailPath == path {
+	if s.FailPath == path && (s.FailTimes == 0 || s.failed < s.FailTimes) {
+		s.failed++
 		reply(w, s.FailStatus, path, nil, nil)
 		return
 	}
